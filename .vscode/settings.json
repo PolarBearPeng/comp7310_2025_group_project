@@ -1,0 +1,12 @@
+{
+    "idf.espIdfPath": "/Users/pengziyu/esp/v5.4/esp-idf",
+    "idf.toolsPath": "/Users/pengziyu/.espressif",
+    "idf.pythonInstallPath": "/usr/bin/python3",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c5"
+    },
+    "idf.openOcdConfigs": [
+        "board/esp32c5-builtin.cfg"
+    ],
+    "cmake.ignoreCMakeListsMissing": true
+}
