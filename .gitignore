@@ -1,5 +1,4 @@
 build/
 benchmark/
 .DS_Store
-settings.json
 prompt.txt

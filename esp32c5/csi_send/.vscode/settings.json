@@ -1,4 +1,10 @@
 {
-    "idf.port": "/dev/tty.usbserial-10",
-    "idf.flashType": "UART"
+    "idf.port": "/dev/tty.usbmodem1101",
+    "idf.flashType": "UART",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c5"
+    },
+    "idf.openOcdConfigs": [
+        "board/esp32c5-builtin.cfg"
+    ]
 }
