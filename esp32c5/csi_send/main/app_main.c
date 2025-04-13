@@ -28,7 +28,7 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   40
+#define CONFIG_LESS_INTERFERENCE_CHANNEL   153
 #define CONFIG_WIFI_BAND_MODE   WIFI_BAND_MODE_5G_ONLY
 #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20
 #define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20
@@ -38,7 +38,7 @@
 #define CONFIG_ESP_NOW_RATE             WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_SEND_FREQUENCY               100
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01};
 static const char *TAG = "csi_send";
 
 static void wifi_init()
@@ -52,8 +52,17 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
+    // 在启动WiFi之前设置MAC地址可能更可靠
+    ESP_LOGI(TAG, "Setting MAC address to: "MACSTR, MAC2STR(CONFIG_CSI_SEND_MAC));
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // 验证MAC地址是否真正被设置
+    uint8_t actual_mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, actual_mac);
+    ESP_LOGI(TAG, "Actual MAC address: "MACSTR, MAC2STR(actual_mac));
+
     esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE);
     wifi_protocols_t protocols = {
         .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
@@ -76,6 +85,18 @@ static void wifi_init()
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
     }
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+
+    // 确保MAC地址在所有WiFi配置后仍然正确
+    ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+        
+    // 再次验证MAC地址
+    esp_wifi_get_mac(WIFI_IF_STA, actual_mac);
+    ESP_LOGI(TAG, "Final MAC address: "MACSTR, MAC2STR(actual_mac));
+
+    if (memcmp(CONFIG_CSI_SEND_MAC, actual_mac, 6) != 0) {
+        ESP_LOGW(TAG, "CRITICAL WARNING: Could not set desired MAC address after all configurations!");
+        ESP_LOGW(TAG, "You must update the CSI_RECV code to use MAC address: "MACSTR, MAC2STR(actual_mac));
+    }
 }
 
 static void wifi_esp_now_init(esp_now_peer_info_t peer) 
@@ -122,14 +143,17 @@ void app_main()
     };
     wifi_esp_now_init(peer);
 
+    // 获取最终的MAC地址用于显示
+    uint8_t final_mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, final_mac);
     ESP_LOGI(TAG, "================ CSI SEND ================");
     ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, mac: " MACSTR,
              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
     
     // YOUR CODE HERE
     ESP_LOGI(TAG, "================ GROUP INFO ================");
-    const char *TEAM_MEMBER[] = {"a", "b", "c", "d"};
-    const char *TEAM_UID[] = {"1", "2", "3", "4"};
+    const char *TEAM_MEMBER[] = {"Peng Ziyu", "Liu Zicheng", "Lin Jiaqi", "Li Baipeng"};
+    const char *TEAM_UID[] = {"3036382985", "3036381931", "3036379964", "3036380781"};
     ESP_LOGI(TAG, "TEAM_MEMBER: %s, %s, %s, %s | TEAM_UID: %s, %s, %s, %s",
                 TEAM_MEMBER[0], TEAM_MEMBER[1], TEAM_MEMBER[2], TEAM_MEMBER[3],
                 TEAM_UID[0], TEAM_UID[1], TEAM_UID[2], TEAM_UID[3]);
