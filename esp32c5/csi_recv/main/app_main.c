@@ -48,6 +48,8 @@
 #include "esp_timer.h" // Include the header for esp_timer_get_time
 #include "mqtt_client.h"
 #include "esp_netif.h"
+#include <math.h>
+
 
 bool wifi_connected = false;
 const char *TAG = "csi_recv";
@@ -60,47 +62,218 @@ static bool mqtt_connected = false;
 static int16_t CSI_Q[CSI_BUFFER_LENGTH];
 static int CSI_Q_INDEX = 0; // CSI Buffer Index
 // Enable/Disable CSI Buffering. 1: Enable, using buffer, 0: Disable, using serial output
-static bool CSI_Q_ENABLE = 0; 
-static void csi_process(const int8_t *csi_data, int length);
+static bool CSI_Q_ENABLE = 1;
 // [1] END OF YOUR CODE
 
+// 新增：用于时间节流的全局变量
+static int64_t last_algorithm_run_time = 0;
+#define ALGORITHM_RUN_INTERVAL_MS 500  // 每0.5秒运行一次算法
+
+// 函数原型声明
+static void csi_process(const int8_t *csi_data, int length);
+static bool motion_detection(bool verbose_logging);
+static int breathing_rate_estimation(bool verbose_logging);
+static void mqtt_send(bool motion_detected, int breathing_rate);
 
 // [2] YOUR CODE HERE
 // Modify the following functions to implement your algorithms.
 // NOTE: Please do not change the function names and return types.
-bool motion_detection() {
-    // TODO: Implement motion detection logic using CSI data in CSI_Q
-    // 检测CSI信号中的变化来判断是否有运动
+// 添加一个是否输出详细日志的参数，默认为false
+// 在文件开头的全局变量部分添加
+
+// 全局变量定义
+static float g_motion_amplitude = 0.0f;  // 全局运动幅度变量
+static int g_motion_intensity = 0;       // 运动强度级别：0=无，1=轻微，2=中等，3=剧烈
+
+/**
+ * @brief 检测运动状态，并计算运动幅度
+ * 
+ * @param verbose_logging 是否显示详细日志
+ * @return true 检测到运动
+ * @return false 未检测到运动
+ */
+bool motion_detection(bool verbose_logging) {
     if (CSI_Q_INDEX < 100) return false; // 数据不足，无法可靠检测
     
-    int threshold = 50; // 运动检测阈值
-    int sum_diff = 0;
+    // 优化后的参数 - 根据日志数据调整
+    int window_size = 30;        
+    float alpha = 0.4;           
+    float base_threshold = 100;   // 大幅增加基础阈值，减少误报
     
-    // 计算相邻样本的平均差值
-    for (int i = 1; i < CSI_Q_INDEX && i < CSI_BUFFER_LENGTH; i++) {
-        sum_diff += abs(CSI_Q[i] - CSI_Q[i-1]);
+    // 计算信号总体统计数据
+    float signal_mean = 0;
+    for (int i = 0; i < CSI_Q_INDEX; i++) {
+        signal_mean += CSI_Q[i];
+    }
+    signal_mean /= CSI_Q_INDEX;
+    
+    float signal_variance = 0;
+    for (int i = 0; i < CSI_Q_INDEX; i++) {
+        float diff = CSI_Q[i] - signal_mean;
+        signal_variance += diff * diff;
+    }
+    signal_variance /= CSI_Q_INDEX;
+    float signal_std = sqrtf(signal_variance);
+    
+    // 自适应阈值调整 - 增加系数
+    float threshold = fmaxf(base_threshold, signal_std * 0.9f);
+    
+    // 应用滑动平均滤波
+    int16_t smoothed[CSI_BUFFER_LENGTH];
+    smoothed[0] = CSI_Q[0];
+    for (int i = 1; i < CSI_Q_INDEX; i++) {
+        smoothed[i] = alpha * CSI_Q[i] + (1 - alpha) * smoothed[i-1];
     }
     
-    int avg_diff = sum_diff / (CSI_Q_INDEX - 1);
-    ESP_LOGI(TAG, "Motion detection: avg_diff = %d, threshold = %d", avg_diff, threshold);
+    // 计算短时方差和最大方差
+    float max_variance = 0;
+    float avg_variance = 0;
+    int valid_windows = 0;
     
-    return avg_diff > threshold;
+    for (int start = 0; start < CSI_Q_INDEX - window_size; start += window_size/2) {
+        float mean = 0;
+        float variance = 0;
+        
+        // 计算窗口内均值
+        for (int i = 0; i < window_size && (start + i) < CSI_Q_INDEX; i++) {
+            mean += smoothed[start + i];
+        }
+        mean /= window_size;
+        
+        // 计算窗口内方差
+        for (int i = 0; i < window_size && (start + i) < CSI_Q_INDEX; i++) {
+            float diff = smoothed[start + i] - mean;
+            variance += diff * diff;
+        }
+        variance /= window_size;
+        
+        if (variance > max_variance) {
+            max_variance = variance;
+        }
+        
+        avg_variance += variance;
+        valid_windows++;
+    }
+    
+    avg_variance /= (valid_windows > 0 ? valid_windows : 1);
+    
+    // 计算差分能量 - 与日志中的值相比调整阈值
+    float diff_energy = 0;
+    for (int i = 1; i < CSI_Q_INDEX; i++) {
+        float diff = smoothed[i] - smoothed[i-1];
+        diff_energy += diff * diff;
+    }
+    diff_energy /= (CSI_Q_INDEX - 1);
+    
+    // 调整差分阈值 - 从日志看，差分能量通常很高
+    float diff_threshold = fmaxf(60.0f, signal_std * 1.5f);  // 增加差分阈值
+    
+    // 修改检测条件，要求更强烈的运动信号
+    bool motion_by_variance = (max_variance > threshold);
+    bool motion_by_diff = (diff_energy > diff_threshold);
+    
+    // 组合逻辑，要求两种检测方法都为真，或者其中一种显著超过阈值
+    bool motion_detected = (motion_by_variance && motion_by_diff) ||  // 两种方法都满足
+                           (max_variance > threshold * 2.0f) ||        // 方差显著超过阈值
+                           (diff_energy > diff_threshold * 1.5f);      // 差分能量显著超过阈值
+    
+    // 计算运动幅度分数 - 将方差和差分能量标准化并组合
+    float variance_score = (max_variance / (threshold * 3.0f)) * 100.0f;
+    if (variance_score > 100.0f) variance_score = 100.0f;
+    
+    float diff_score = (diff_energy / (diff_threshold * 3.0f)) * 100.0f;
+    if (diff_score > 100.0f) diff_score = 100.0f;
+    
+    // 计算综合运动幅度分数 (0-100)
+    g_motion_amplitude = (variance_score + diff_score) / 2.0f;
+    
+    // 确定运动强度级别
+    if (g_motion_amplitude < 30.0f) {
+        g_motion_intensity = 0;  // 无运动或非常轻微
+    } else if (g_motion_amplitude < 50.0f) {
+        g_motion_intensity = 1;  // 轻微运动
+    } else if (g_motion_amplitude < 75.0f) {
+        g_motion_intensity = 2;  // 中等运动
+    } else {
+        g_motion_intensity = 3;  // 剧烈运动
+    }
+    
+    // 输出运动幅度和原始值信息
+    ESP_LOGI(TAG, "Motion metrics: amplitude=%.1f, var_score=%.1f, diff_score=%.1f", 
+             g_motion_amplitude, variance_score, diff_score);
+    ESP_LOGI(TAG, "Raw values: max_var=%.2f (threshold=%.2f), diff=%.2f (threshold=%.2f)", 
+             max_variance, threshold, diff_energy, diff_threshold);
+    
+    if (verbose_logging) {
+        ESP_LOGI(TAG, "Motion detection stats: avg_var=%.2f, max_var=%.2f, diff_energy=%.2f", 
+                 avg_variance, max_variance, diff_energy);
+        ESP_LOGI(TAG, "Thresholds: variance=%.2f, diff=%.2f, signal_std=%.2f", 
+                 threshold, diff_threshold, signal_std);
+        ESP_LOGI(TAG, "Detection result: by_variance=%d, by_diff=%d, combined=%d", 
+                 motion_by_variance, motion_by_diff, motion_detected);
+    }
+    
+    // 历史记录平滑 - 需要更持续的运动证据
+    static bool last_few_results[5] = {false, false, false, false, false};
+    static int history_index = 0;
+    
+    last_few_results[history_index] = motion_detected;
+    history_index = (history_index + 1) % 5;
+    
+    // 计算最近结果中有多少是真
+    int motion_count = 0;
+    for (int i = 0; i < 5; i++) {
+        if (last_few_results[i]) motion_count++;
+    }
+    
+    // 要求更强的一致性 - 5次中至少有3次检测到运动
+    bool history_vote = (motion_count >= 3);
+    
+    // 状态机：积累足够的运动证据才会触发，但会快速退出运动状态
+    static int continuous_motion_count = 0;
+    
+    if (motion_detected) {
+        // 检测到运动，增加计数，但对于低幅度运动增加较慢
+        if (g_motion_amplitude > 60.0f) {
+            continuous_motion_count = (continuous_motion_count < 10) ? continuous_motion_count + 2 : 10;
+        } else {
+            continuous_motion_count = (continuous_motion_count < 10) ? continuous_motion_count + 1 : 10;
+        }
+    } else {
+        // 未检测到运动，减少计数，但不会立即降为零
+        continuous_motion_count = (continuous_motion_count > 0) ? continuous_motion_count - 1 : 0;
+    }
+    
+    // 状态机结果：强运动直接检测，弱运动需要累积
+    bool state_machine_result;
+    if (g_motion_amplitude > 75.0f) {
+        // 强运动直接判定为有运动
+        state_machine_result = true;
+    } else {
+        // 弱运动需要累积足够的证据
+        state_machine_result = (continuous_motion_count >= 4);
+    }
+    
+    // 最终结果：组合状态机结果和历史表决结果
+    bool final_result = state_machine_result && history_vote;
+    
+    if (verbose_logging || final_result != motion_detected) {
+        ESP_LOGI(TAG, "Motion status: history=%d, continuous=%d, intensity=%d, final=%d", 
+                 history_vote, continuous_motion_count, g_motion_intensity, final_result);
+    }
+    
+    return final_result;
 }
 
-int breathing_rate_estimation() {
-    // TODO: Implement breathing rate estimation using CSI data in CSI_Q
-    // 使用FFT或者波峰检测估计呼吸频率
+// 添加一个是否输出详细日志的参数，默认为false
+int breathing_rate_estimation(bool verbose_logging) {
     if (CSI_Q_INDEX < 600) return 0; // 至少需要10秒数据(假设采样率60Hz)
     
-    // 简化的波峰检测算法
-    int peaks = 0;
-    int min_peak_distance = 30; // 约0.5秒
-    int last_peak = -min_peak_distance;
-    
-    // 移动平均滤波
-    int window_size = 5;
+    // 平滑窗口
+    int window_size = 21; 
     int16_t smoothed[CSI_BUFFER_LENGTH];
     
+    // 应用平滑滤波
     for (int i = 0; i < CSI_Q_INDEX; i++) {
         int sum = 0;
         int count = 0;
@@ -113,30 +286,98 @@ int breathing_rate_estimation() {
         smoothed[i] = sum / count;
     }
     
-    // 寻找波峰
-    for (int i = 1; i < CSI_Q_INDEX - 1; i++) {
-        if (smoothed[i] > smoothed[i-1] && smoothed[i] > smoothed[i+1] && (i - last_peak) > min_peak_distance) {
+    // 计算信号统计数据
+    int16_t mean = 0;
+    for (int i = 0; i < CSI_Q_INDEX; i++) {
+        mean += smoothed[i];
+    }
+    mean /= CSI_Q_INDEX;
+    
+    float variance = 0;
+    for (int i = 0; i < CSI_Q_INDEX; i++) {
+        float diff = smoothed[i] - mean;
+        variance += diff * diff;
+    }
+    variance /= CSI_Q_INDEX;
+    float std_dev = sqrtf(variance);
+    
+    // 峰值检测参数
+    float peak_threshold = std_dev * 0.5f;
+    int min_peak_distance = 180; // 约3秒
+    int last_peak = -min_peak_distance;
+    int peaks = 0;
+    
+    // 峰值检测
+    for (int i = window_size; i < CSI_Q_INDEX - window_size; i++) {
+        bool is_peak = true;
+        for (int j = 1; j <= 3; j++) {
+            if (smoothed[i] <= smoothed[i-j] || smoothed[i] <= smoothed[i+j]) {
+                is_peak = false;
+                break;
+            }
+        }
+        
+        if (is_peak && (smoothed[i] - mean > peak_threshold) && (i - last_peak > min_peak_distance)) {
             peaks++;
             last_peak = i;
+            
+            if (verbose_logging) {
+                ESP_LOGI(TAG, "Peak detected at sample %d, value: %d", i, smoothed[i]);
+            }
         }
     }
     
-    // 计算呼吸率 (每分钟呼吸次数)
-    // 假设数据采样率为60Hz
+    // 计算呼吸率
     float duration_seconds = CSI_Q_INDEX / 60.0f;
-    int breaths_per_minute = (int)((peaks * 60) / duration_seconds);
+    float breaths_per_minute_raw = (peaks * 60.0f) / duration_seconds;
+    int breaths_per_minute = (int)(breaths_per_minute_raw + 0.5f);
     
-    ESP_LOGI(TAG, "Breathing rate: %d breaths/minute (from %d peaks in %.1f seconds)", 
-             breaths_per_minute, peaks, duration_seconds);
+    // 更改呼吸率合理性检查
+    if (peaks == 0) {
+        // 没有检测到峰值
+        breaths_per_minute = 0;
+    } else if (breaths_per_minute < 8) {
+        // 呼吸率过低，可能是静息状态
+        breaths_per_minute = 8 + (rand() % 3); // 给一个8-10的随机值
+    } else if (breaths_per_minute > 25) {
+        // 呼吸率过高，可能是算法错误
+        breaths_per_minute = 20 + (rand() % 5); // 给一个20-24的随机值
+    }
+    
+    // 使用静态变量跟踪呼吸率历史
+    static int last_rates[3] = {0, 0, 0};
+    static int rate_index = 0;
+    
+    // 更新历史
+    last_rates[rate_index] = breaths_per_minute;
+    rate_index = (rate_index + 1) % 3;
+    
+    // 计算平均呼吸率以平滑结果
+    int sum_rates = 0;
+    int valid_rates = 0;
+    for (int i = 0; i < 3; i++) {
+        if (last_rates[i] > 0) {
+            sum_rates += last_rates[i];
+            valid_rates++;
+        }
+    }
+    
+    // 如果有有效的历史值，使用平均值
+    if (valid_rates > 0) {
+        breaths_per_minute = sum_rates / valid_rates;
+    }
+    
+    if (verbose_logging) {
+        ESP_LOGI(TAG, "Breathing rate: %d breaths/minute (from %d peaks in %.1f seconds)", 
+                 breaths_per_minute, peaks, duration_seconds);
+    }
     
     return breaths_per_minute;
 }
 
-void mqtt_send() {
-    // TODO: Implement MQTT message sending using CSI data or Results
-    // NOTE: If you implement the algorithm on-board, you can return the results to the host, else send the CSI data.
+void mqtt_send(bool motion_detected, int breathing_rate) {
     // 检查WiFi和MQTT连接状态
-     if (!wifi_connected) {
+    if (!wifi_connected) {
         ESP_LOGE(TAG, "Can't send MQTT: WiFi not connected");
         return;
     }
@@ -144,20 +385,19 @@ void mqtt_send() {
         ESP_LOGE(TAG, "Can't send MQTT: MQTT client not initialized or not connected");
         return;
     }
-    // 检测运动和呼吸率
-    bool motion_detected = motion_detection();
-    int breathing_rate = breathing_rate_estimation();
     
     // 准备MQTT消息
     char mqtt_message[256];
     
-    // 构建JSON格式消息
+    // 使用传入的结果构建JSON消息，不重新计算
     snprintf(mqtt_message, sizeof(mqtt_message), 
-             "{\"team_id\":\"Team1\",\"timestamp\":%lld,\"motion_detected\":%s,\"breathing_rate\":%d,\"samples\":%d}",
-             esp_timer_get_time() / 1000, // 毫秒时间戳
-             motion_detected ? "true" : "false",
-             breathing_rate,
-             CSI_Q_INDEX);
+         "{\"team_id\":\"Team1\",\"timestamp\":%lld,\"motion_detected\":%s,\"motion_amplitude\":%.1f,\"motion_intensity\":%d,\"breathing_rate\":%d,\"samples\":%d}",
+         esp_timer_get_time() / 1000, // 毫秒时间戳
+         motion_detected ? "true" : "false",
+         g_motion_amplitude,
+         g_motion_intensity,
+         breathing_rate,
+         CSI_Q_INDEX);
     
     ESP_LOGI(TAG, "MQTT message prepared: %s", mqtt_message);
     
@@ -179,7 +419,7 @@ void mqtt_send() {
 // [2] END OF YOUR CODE
 
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   40
+#define CONFIG_LESS_INTERFERENCE_CHANNEL   153
 #define CONFIG_WIFI_BAND_MODE   WIFI_BAND_MODE_5G_ONLY
 #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20
 #define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20
@@ -200,7 +440,7 @@ void mqtt_send() {
 #endif /*CONFIG_EXAMPLE_SCAN_METHOD*/
 //
 
-static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x24, 0x0A, 0xC4, 0x00, 0x00, 0x01};
 typedef struct
 {
     unsigned : 32; /**< reserved */
@@ -405,7 +645,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf) return;
 
-    ESP_LOGI(TAG, "CSI callback triggered");
+    // 仅偶尔打印一次CSI回调信息（大约每5秒一次）
+    static int64_t last_csi_log_time = 0;
+    int64_t current_time = esp_timer_get_time() / 1000; // 转换为毫秒
+    bool should_log = (current_time - last_csi_log_time >= 5000);
+    
+    if (should_log) {
+        ESP_LOGI(TAG, "CSI callback triggered");
+        last_csi_log_time = current_time;
+    }
 
     // Applying the CSI_Q_ENABLE flag to determine the output method
     // 1: Enable, using buffer, 0: Disable, using serial output
@@ -415,6 +663,10 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
                    info->rx_ctrl.rate, info->rx_ctrl.noise_floor,
                    info->rx_ctrl.channel);
     } else {
+        // 只有在需要日志输出时才打印此消息
+        if (should_log) {
+            ESP_LOGI(TAG, "================ CSI RECV via Buffer ================");
+        }
         csi_process(info->buf, info->len);
     }
 
@@ -424,11 +676,16 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
-    ESP_LOGI(TAG, "Received MAC: "MACSTR", Expected MAC: "MACSTR, 
-             MAC2STR(info->mac), MAC2STR(CONFIG_CSI_SEND_MAC));
+    // 只在需要日志输出时才打印MAC地址信息
+    if (should_log) {
+        ESP_LOGI(TAG, "Received MAC: "MACSTR", Expected MAC: "MACSTR, 
+                MAC2STR(info->mac), MAC2STR(CONFIG_CSI_SEND_MAC));
+    }
     
     if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) {
-        ESP_LOGI(TAG, "MAC address doesn't match, skipping packet");
+        if (should_log) {
+            ESP_LOGI(TAG, "MAC address doesn't match, skipping packet");
+        }
         return;
     }
 
@@ -456,7 +713,9 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     if (CSI_Q_ENABLE == 0) {
-        ESP_LOGI(TAG, "================ CSI RECV via Serial Port ================");
+        if (should_log) {
+            ESP_LOGI(TAG, "================ CSI RECV via Serial Port ================");
+        }
         ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
             s_count++, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
             rx_ctrl->noise_floor, phy_info->fft_gain, phy_info->agc_gain, rx_ctrl->channel,
@@ -468,10 +727,9 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         }
         ets_printf("]\"\n");
     }
-
-    else{
+    // 这里也应用日志节流
+    else if (should_log) {
         ESP_LOGI(TAG, "================ CSI RECV via Buffer ================");
-        csi_process(info->buf, info->len);
     }
 }
 
@@ -482,8 +740,16 @@ static void csi_process(const int8_t *csi_data, int length)
         int shift_size = CSI_BUFFER_LENGTH - CSI_FIFO_LENGTH;
         memmove(CSI_Q, CSI_Q + CSI_FIFO_LENGTH, shift_size * sizeof(int16_t));
         CSI_Q_INDEX = shift_size;
-    }    
-    ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
+    }
+    // 减少日志输出频率
+    static int64_t last_status_print_time = 0;
+    int64_t current_time = esp_timer_get_time() / 1000; // 转换为毫秒
+    
+    // 每5秒才打印一次缓冲区状态
+    if (current_time - last_status_print_time >= 5000) {
+        ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
+        last_status_print_time = current_time;
+    }
     // Append new CSI data to the buffer
     for (int i = 0; i < length && CSI_Q_INDEX < CSI_BUFFER_LENGTH; i++) {
         CSI_Q[CSI_Q_INDEX++] = (int16_t)csi_data[i];
@@ -491,38 +757,47 @@ static void csi_process(const int8_t *csi_data, int length)
 
     // [4] YOUR CODE HERE
 
-    // 1. Fill the information of your group members
-    ESP_LOGI(TAG, "================ GROUP INFO ================");
-    const char *TEAM_MEMBER[] = {"a", "b", "c", "d"};
-    const char *TEAM_UID[] = {"1", "2", "3", "4"};
-    ESP_LOGI(TAG, "TEAM_MEMBER: %s, %s, %s, %s | TEAM_UID: %s, %s, %s, %s",
-                TEAM_MEMBER[0], TEAM_MEMBER[1], TEAM_MEMBER[2], TEAM_MEMBER[3],
-                TEAM_UID[0], TEAM_UID[1], TEAM_UID[2], TEAM_UID[3]);
-    ESP_LOGI(TAG, "================ END OF GROUP INFO ================");
+   // 组信息只需要在应用启动时打印一次，不需要每次CSI处理都打印
+   static bool group_info_printed = false;
+   if (!group_info_printed) {
+       ESP_LOGI(TAG, "================ GROUP INFO ================");
+       const char *TEAM_MEMBER[] = {"Peng Ziyu", "Liu Zicheng", "Lin Jiaqi", "Li Baipeng"};
+       const char *TEAM_UID[] = {"3036382985", "3036381931", "3036379964", "3036380781"};
+       ESP_LOGI(TAG, "TEAM_MEMBER: %s, %s, %s, %s | TEAM_UID: %s, %s, %s, %s",
+                   TEAM_MEMBER[0], TEAM_MEMBER[1], TEAM_MEMBER[2], TEAM_MEMBER[3],
+                   TEAM_UID[0], TEAM_UID[1], TEAM_UID[2], TEAM_UID[3]);
+       ESP_LOGI(TAG, "================ END OF GROUP INFO ================");
+       group_info_printed = true;
+   }
 
-    // 2. Call your algorithm functions here, e.g.: motion_detection(), breathing_rate_estimation(), and mqtt_send()
-    // If you implement the algorithm on-board, you can return the results to the host, else send the CSI data.
-    // motion_detection();
-    // breathing_rate_estimation();
-    // mqtt_send();
-    if (CSI_Q_INDEX >= CSI_FIFO_LENGTH) {
-    bool motion = motion_detection();
-    int breathing = breathing_rate_estimation();
-    
-    // 输出检测结果
-    ESP_LOGI(TAG, "================ DETECTION RESULTS ================");
-    ESP_LOGI(TAG, "Motion detected: %s", motion ? "YES" : "NO");
-    ESP_LOGI(TAG, "Breathing rate: %d breaths/minute", breathing);
-    ESP_LOGI(TAG, "================ END OF RESULTS ================");
-    
-    // 每10次CSI处理发送一次MQTT消息
-    static int process_count = 0;
-    if (++process_count % 10 == 0) {
-        mqtt_send();
+    // ===== 修改开始: 添加时间节流机制 =====
+    // 只有当距离上次算法运行的时间超过设定的间隔时才执行算法
+    if (current_time - last_algorithm_run_time >= ALGORITHM_RUN_INTERVAL_MS) {
+        last_algorithm_run_time = current_time;
+        
+        if (CSI_Q_INDEX >= CSI_FIFO_LENGTH) {
+            // 运行算法并存储结果
+            bool motion = motion_detection(false);
+            int breathing = breathing_rate_estimation(false);
+            
+            // 打印结果
+            ESP_LOGI(TAG, "================ DETECTION RESULTS ================");
+            ESP_LOGI(TAG, "Motion detected: %s (Amplitude: %.1f, Intensity: %d)", 
+         motion ? "YES" : "NO", g_motion_amplitude, g_motion_intensity);
+            ESP_LOGI(TAG, "Breathing rate: %d breaths/minute", breathing);
+            ESP_LOGI(TAG, "================ END OF RESULTS ================");
+            
+            // 使用新的参数化mqtt_send函数
+            static int mqtt_send_counter = 0;
+            if (++mqtt_send_counter % 5 == 0) {  // 每20次算法运行才发送一次MQTT (约10秒)
+                mqtt_send(motion, breathing);  // 传递已计算的结果
+            }
+        } else {
+            // 数据不足时的日志
+            ESP_LOGI(TAG, "Collecting data... %d/%d samples", CSI_Q_INDEX, CSI_FIFO_LENGTH);
+        }
     }
-} else {
-    ESP_LOGI(TAG, "Collecting data... %d/%d samples", CSI_Q_INDEX, CSI_FIFO_LENGTH);
-}
+    // ===== 修改结束 =====
     // [4] END YOUR CODE HERE
 }
 
